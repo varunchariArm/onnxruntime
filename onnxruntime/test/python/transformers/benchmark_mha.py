@@ -8,17 +8,19 @@ Benchmark performance of MultiHeadAttention with Nvidia GPU of Compute Capabilit
 sh benchmark_mha.sh
 """
 
+import csv
 import math
 import os
 import platform
 import statistics
 import time
-from typing import List, Optional
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from onnx import TensorProto, helper
 
-from onnxruntime import InferenceSession, get_available_providers
+from onnxruntime import InferenceSession, SessionOptions, get_available_providers
 from onnxruntime.transformers.io_binding_helper import CudaSession
 
 
@@ -114,46 +116,48 @@ class MultiHeadAttentionConfig:
         )
 
     def shape_dict(self, input_format=None):
+        shapes: Dict[str, Tuple] = {
+            "output": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
+        }
+
         input_format = input_format or self.input_format
-        if input_format == InputFormats.Q_K_V_BSNH_BNSH_BNSH:
-            # cross attention does not have past state
-            return {
+        if input_format == InputFormats.QKV_BSN3H:
+            shapes = {
+                **shapes,
+                "query": (self.batch_size, self.sequence_length, self.num_heads, 3, self.head_size),
+            }
+        elif input_format == InputFormats.Q_KV_BSNH_BSN2H:
+            shapes = {
+                **shapes,
+                "query": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
+                "key": (self.batch_size, self.sequence_length, self.num_heads, 2, self.head_size),
+            }
+        elif input_format == InputFormats.Q_K_V_BSNH_BSNH_BSNH:
+            shapes = {
+                **shapes,
+                "query": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
+                "key": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
+                "value": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
+            }
+        else:
+            assert input_format == InputFormats.Q_K_V_BSNH_BNSH_BNSH
+            shapes = {
+                **shapes,
                 "query": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
                 "key": (self.batch_size, self.num_heads, self.sequence_length, self.head_size),
                 "value": (self.batch_size, self.num_heads, self.sequence_length, self.head_size),
-                "output": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
             }
 
         if self.use_kv_cache:
+            assert input_format != InputFormats.Q_K_V_BSNH_BNSH_BNSH, "cross attention shall not have past state"
             shapes = {
+                **shapes,
                 "past_key": (self.batch_size, self.num_heads, self.past_buffer_length, self.head_size),
                 "past_value": (self.batch_size, self.num_heads, self.past_buffer_length, self.head_size),
-                "output": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
                 "present_key": (self.batch_size, self.num_heads, self.present_buffer_length, self.head_size),
                 "present_value": (self.batch_size, self.num_heads, self.present_buffer_length, self.head_size),
             }
-        else:
-            shapes = {
-                "output": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
-            }
 
-        if input_format == InputFormats.QKV_BSN3H:
-            shapes.update({"query": (self.batch_size, self.sequence_length, self.num_heads, 3, self.head_size)})
-        elif input_format == InputFormats.Q_KV_BSNH_BSN2H:
-            shapes.update(
-                {
-                    "query": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
-                    "key": (self.batch_size, self.sequence_length, self.num_heads, 2, self.head_size),
-                }
-            )
-        else:  # input_format == InputFormats.Q_K_V_BSNH_BSNH_BSNH
-            shapes.update(
-                {
-                    "query": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
-                    "key": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
-                    "value": (self.batch_size, self.sequence_length, self.num_heads * self.head_size),
-                }
-            )
         return shapes
 
     def random_inputs(self, seed: int = 123):
@@ -172,44 +176,42 @@ class MultiHeadAttentionConfig:
         k_bnsh = k.transpose(1, 2)
         v_bnsh = v.transpose(1, 2)
 
-        if self.input_format == InputFormats.Q_K_V_BSNH_BNSH_BNSH:
-            return {
+        if self.input_format == InputFormats.Q_K_V_BSNH_BSNH_BSNH:
+            feeds = {
+                "query": q.reshape(shape_dict["query"]),
+                "key": k.reshape(shape_dict["key"]),
+                "value": v.reshape(shape_dict["value"]),
+            }
+        elif self.input_format == InputFormats.QKV_BSN3H:
+            query = q.view(self.batch_size * self.sequence_length, self.num_heads, self.head_size)
+            key = k.view(self.batch_size * self.sequence_length, self.num_heads, self.head_size)
+            value = v.view(self.batch_size * self.sequence_length, self.num_heads, self.head_size)
+            feeds = {
+                "query": torch.dstack((query, key, value)).reshape(shape_dict["query"]).contiguous(),
+            }
+        elif self.input_format == InputFormats.Q_KV_BSNH_BSN2H:
+            key = k.view(self.batch_size * self.sequence_length, self.num_heads, self.head_size)
+            value = v.view(self.batch_size * self.sequence_length, self.num_heads, self.head_size)
+            feeds = {
+                "query": q.reshape(shape_dict["query"]),
+                "key": torch.dstack((key, value)).reshape(shape_dict["key"]).contiguous(),
+            }
+        else:
+            assert self.input_format == InputFormats.Q_K_V_BSNH_BNSH_BNSH
+            feeds = {
                 "query": q.reshape(shape_dict["query"]),
                 "key": k_bnsh.contiguous(),
                 "value": v_bnsh.contiguous(),
             }
 
-        feeds = {}
         if self.use_kv_cache:
-            feeds.update(
-                {
-                    "past_key": torch.empty(shape_dict["past_key"], device=device, dtype=dtype).normal_(
-                        mean=0, std=0.1
-                    ),
-                    "past_value": torch.empty(shape_dict["past_value"], device=device, dtype=dtype).normal_(
-                        mean=0, std=0.1
-                    ),
-                }
-            )
-
-        if self.input_format == InputFormats.Q_K_V_BSNH_BSNH_BSNH:
-            feeds.update(
-                {
-                    "query": q.reshape(shape_dict["query"]),
-                    "key": k.reshape(shape_dict["key"]),
-                    "value": v.reshape(shape_dict["value"]),
-                }
-            )
-        elif self.input_format == InputFormats.QKV_BSN3H:
-            query = q.view(self.batch_size * self.sequence_length, self.num_heads, self.head_size)
-            key = k.view(self.batch_size * self.sequence_length, self.num_heads, self.head_size)
-            value = v.view(self.batch_size * self.sequence_length, self.num_heads, self.head_size)
-            feeds["query"] = torch.dstack((query, key, value)).reshape(shape_dict["query"]).contiguous()
-        elif self.input_format == InputFormats.Q_KV_BSNH_BSN2H:
-            key = k.view(self.batch_size * self.sequence_length, self.num_heads, self.head_size)
-            value = v.view(self.batch_size * self.sequence_length, self.num_heads, self.head_size)
-            feeds["query"] = q.reshape(shape_dict["query"])
-            feeds["key"] = torch.dstack((key, value)).reshape(shape_dict["key"]).contiguous()
+            feeds = {
+                **feeds,
+                "past_key": torch.empty(shape_dict["past_key"], device=device, dtype=dtype).normal_(mean=0, std=0.1),
+                "past_value": torch.empty(shape_dict["past_value"], device=device, dtype=dtype).normal_(
+                    mean=0, std=0.1
+                ),
+            }
 
         return feeds
 
@@ -275,9 +277,7 @@ def create_multi_head_attention_onnx_model(config: MultiHeadAttentionConfig):
     return model.SerializeToString()
 
 
-def create_session(
-    config: MultiHeadAttentionConfig,
-) -> CudaSession:
+def create_session(config: MultiHeadAttentionConfig, session_options=None) -> CudaSession:
     onnx_model_str = create_multi_head_attention_onnx_model(config)
 
     if config.provider == "CUDAExecutionProvider":
@@ -287,7 +287,7 @@ def create_session(
     else:
         providers = ["CPUExecutionProvider"]
 
-    ort_session = InferenceSession(onnx_model_str, providers=providers)
+    ort_session = InferenceSession(onnx_model_str, session_options, providers=providers)
     cuda_session = CudaSession(ort_session, config.device, config.enable_cuda_graph)
     shape_dict = config.shape_dict()
     cuda_session.allocate_buffers(shape_dict)
@@ -297,11 +297,8 @@ def create_session(
 class OrtMultiHeadAttention:
     """A wrapper of ORT MultiHeadAttention to test relevance and performance."""
 
-    def __init__(
-        self,
-        config: MultiHeadAttentionConfig,
-    ):
-        self.ort_session = create_session(config)
+    def __init__(self, config: MultiHeadAttentionConfig, session_options=None):
+        self.ort_session = create_session(config, session_options)
         self.feed_dict = config.random_inputs()
 
     def infer(self):
@@ -347,13 +344,24 @@ def get_gpu_kernel_name(config: MultiHeadAttentionConfig) -> str:
     return "Unfused"
 
 
-def get_cpu_kernel_name() -> str:
-    if os.getenv("ORT_DISABLE_FLASH_ATTENTION") != "1":
-        return "CPU:Flash"
+def get_cpu_kernel_name(config: MultiHeadAttentionConfig) -> str:
+    # CPU Flash Attention does not support causal and kv cache etc.
+    if not (config.causal or config.use_kv_cache or config.past_sequence_length > 0):
+        if os.getenv("ORT_DISABLE_FLASH_ATTENTION") != "1":
+            return "CPU:Flash"
+
     return "CPU:Unfused"
 
 
-def run_tflops_test(use_gpu: bool = True, enable_cuda_graph: bool = False, repeats: int = 100):
+def run_tflops_test(
+    csv_writer: csv.DictWriter,
+    use_gpu: bool = True,
+    enable_cuda_graph: bool = False,
+    causal: bool = False,
+    use_kv_cache: bool = False,
+    intra_op_num_threads: int = 0,
+    repeats: int = 100,
+):
     if use_gpu:
         device_id = torch.cuda.current_device()
         device = torch.device("cuda", device_id)
@@ -407,11 +415,26 @@ def run_tflops_test(use_gpu: bool = True, enable_cuda_graph: bool = False, repea
         ]
     else:
         configs = [
+            # TNLGv4
             (1, 128, 0, 32, 128, True),
             (1, 256, 0, 32, 128, True),
             (1, 512, 0, 32, 128, True),
             (1, 1024, 0, 32, 128, True),
             (1, 2048, 0, 32, 128, True),
+            # bert-base
+            (1, 128, 0, 12, 64, True),
+            (1, 384, 0, 12, 64, True),
+            (1, 512, 0, 12, 64, True),
+            (4, 128, 0, 12, 64, True),
+            (4, 384, 0, 12, 64, True),
+            (4, 512, 0, 12, 64, True),
+            # bert-large
+            (1, 128, 0, 16, 64, True),
+            (1, 384, 0, 16, 64, True),
+            (1, 512, 0, 16, 64, True),
+            (4, 128, 0, 16, 64, True),
+            (4, 384, 0, 16, 64, True),
+            (4, 512, 0, 16, 64, True),
         ]
 
     # List of environment variables to enable/disable attention kernels
@@ -425,73 +448,128 @@ def run_tflops_test(use_gpu: bool = True, enable_cuda_graph: bool = False, repea
         "ORT_DISABLE_FUSED_CROSS_ATTENTION",
         "ORT_DISABLE_MEMORY_EFFICIENT_ATTENTION",
     ]
+
+    env_list = ""
     for name in env_names:
         value = os.getenv(name)
         if value is not None:
             print(f"{name}={value}")
+            if env_list:
+                env_list += ","
+            env_list += f"{name}={value}"
 
-    print("\nformat\tcausal\tbatch\tseqlen\theads\th_dim\tms\tTFLOPS\tkernel")
-    causal = False
+    print("\nformat\tcausal\tbatch\tseqlen\theads\th_dim\tthreads\tms\tTFLOPS\tkernel")
 
     for input_format in formats:
         for batch_size, sequence_length, past_sequence_length, num_heads, head_size, enable_unfused in configs:
-            for use_kv_cache in [False]:
-                config = MultiHeadAttentionConfig(
-                    batch_size=batch_size,
-                    sequence_length=sequence_length,
-                    num_heads=num_heads,
-                    head_size=head_size,
-                    causal=True,
-                    use_kv_cache=use_kv_cache,
-                    past_sequence_length=past_sequence_length,
-                    max_cache_sequence_length=None,
-                    kv_sequence_length=None,
-                    provider=provider,
-                    enable_cuda_graph=enable_cuda_graph,
-                    device=device,
-                    dtype=torch.float16 if use_gpu else torch.float,
-                    share_past_present_buffer=False,
-                    input_format=input_format,
-                )
+            config = MultiHeadAttentionConfig(
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                num_heads=num_heads,
+                head_size=head_size,
+                causal=causal,
+                use_kv_cache=use_kv_cache,
+                past_sequence_length=past_sequence_length,
+                max_cache_sequence_length=None,
+                kv_sequence_length=None,
+                provider=provider,
+                enable_cuda_graph=enable_cuda_graph,
+                device=device,
+                dtype=torch.float16 if use_gpu else torch.float,
+                share_past_present_buffer=False,
+                input_format=input_format,
+            )
 
-                session = create_session(config)
+            sess_options = SessionOptions()
+            sess_options.intra_op_num_threads = intra_op_num_threads
+            session = create_session(config, sess_options)
 
-                if use_gpu:
-                    kernel = get_gpu_kernel_name(config)
-                else:
-                    kernel = get_cpu_kernel_name()
+            if use_gpu:
+                kernel = get_gpu_kernel_name(config)
+            else:
+                kernel = get_cpu_kernel_name(config)
 
-                if kernel == "Unfused":
-                    # Skip large sequence length for Unfused kernel to avoid OOM.
-                    if not enable_unfused:
-                        continue
+            if kernel == "Unfused":
+                # Skip large sequence length for Unfused kernel to avoid OOM.
+                if not enable_unfused:
+                    continue
 
-                    # Unfused kernel does not support packed QKV or packed KV formats.
-                    if input_format not in [InputFormats.Q_K_V_BSNH_BSNH_BSNH]:
-                        continue
+                # Unfused kernel does not support packed QKV or packed KV formats.
+                if input_format not in [InputFormats.Q_K_V_BSNH_BSNH_BSNH]:
+                    continue
 
-                input_dict = config.random_inputs()
+            input_dict = config.random_inputs()
 
-                # warm up session
-                _ = measure_latency(session, input_dict)
+            # warm up session
+            _ = measure_latency(session, input_dict)
 
-                latency_list = []
-                for _ in range(repeats):
-                    latency = measure_latency(session, input_dict)
-                    latency_list.append(latency)
-                average_latency = statistics.mean(latency_list)
+            latency_list = []
+            for _ in range(repeats):
+                latency = measure_latency(session, input_dict)
+                latency_list.append(latency)
+            average_latency = statistics.mean(latency_list)
 
-                del session
+            del session
 
-                # compute TFLOPS per second
-                speed = tflops_per_second(
-                    flops(batch_size, sequence_length, head_size, num_heads, causal), average_latency
-                )
+            # compute TFLOPS per second
+            speed = tflops_per_second(flops(batch_size, sequence_length, head_size, num_heads, causal), average_latency)
 
-                format = InputFormats.input_format_str(input_format)
-                print(
-                    f"{format}\t{causal}\t{batch_size}\t{sequence_length}\t{num_heads}\t{head_size}\t{average_latency * 1000:.2f}\t{speed:.2f}\t{kernel}"
-                )
+            format = InputFormats.input_format_str(input_format)
+            print(
+                f"{format}\t{causal}\t{batch_size}\t{sequence_length}\t{num_heads}\t{head_size}\t"
+                f"{intra_op_num_threads}\t{average_latency * 1000:.2f}\t{speed:.2f}\t{kernel}"
+            )
+
+            row = {
+                "use_gpu": use_gpu,
+                "enable_cuda_graph": enable_cuda_graph,
+                "format": format,
+                "causal": causal,
+                "batch_size": batch_size,
+                "sequence_length": sequence_length,
+                "past_sequence_length": past_sequence_length,
+                "num_heads": num_heads,
+                "head_size": head_size,
+                "intra_op_num_threads": intra_op_num_threads,
+                "average_latency": average_latency,
+                "tflops": speed,
+                "kernel": kernel,
+                "environment_variables": env_list,
+            }
+            csv_writer.writerow(row)
+
+
+def run_tflops_tests(
+    use_gpu: bool = True,
+    enable_cuda_graph: bool = False,
+):
+    csv_filename = "benchmark_mha_{}_{}.csv".format(
+        "gpu" if use_gpu else "cpu", datetime.now().strftime("%Y%m%d-%H%M%S")
+    )
+    with open(csv_filename, mode="a", newline="") as csv_file:
+        column_names = [
+            "use_gpu",
+            "enable_cuda_graph",
+            "format",
+            "causal",
+            "batch_size",
+            "sequence_length",
+            "past_sequence_length",
+            "num_heads",
+            "head_size",
+            "intra_op_num_threads",
+            "average_latency",
+            "tflops",
+            "kernel",
+            "environment_variables",
+        ]
+        csv_writer = csv.DictWriter(csv_file, fieldnames=column_names)
+        csv_writer.writeheader()
+
+        # for causal, use_kv_cache in [(False, False), (True, True)]:
+        for causal, use_kv_cache in [(True, True)]:
+            for intra_op_num_threads in [1, 2, 4, 8, 16, 0]:  # 0 means using all CPU cores by default.
+                run_tflops_test(csv_writer, use_gpu, enable_cuda_graph, causal, use_kv_cache, intra_op_num_threads)
 
 
 def plot_prompt_performance(
@@ -566,10 +644,9 @@ def plot_prompt_performance(
     benchmark.run(save_path=".", print_data=True)
 
 
-def run_performance_test(sm: int):
+def run_causal_performance_test(sm: int):
     """
     Run performance tests for prompt and token generation.
-
     """
     configures = [
         (1, 32, 128, 8192, "TNLGv4"),
@@ -600,9 +677,9 @@ if __name__ == "__main__":
         if platform.system() == "Linux":
             s = torch.cuda.Stream()
             with torch.cuda.stream(s), torch.no_grad():
-                run_performance_test(sm)
+                run_causal_performance_test(sm)
 
-        run_tflops_test(use_gpu=True, enable_cuda_graph=True)
+        run_tflops_tests(use_gpu=True, enable_cuda_graph=True)
 
     # Test CPU provider
-    run_tflops_test(use_gpu=False, enable_cuda_graph=False)
+    run_tflops_tests(use_gpu=False, enable_cuda_graph=False)
