@@ -180,6 +180,7 @@ CUDAExecutionProvider::PerThreadContext::PerThreadContext(OrtDevice::DeviceId de
 
   CUDNN_CALL_THROW(cudnnCreate(&cudnn_handle_));
   CUDNN_CALL_THROW(cudnnSetStream(cudnn_handle_, stream));
+  LOGS_DEFAULT(INFO) << "cuDNN version: " << cudnnGetVersion();
 #endif
   cuda_graph_.SetStream(stream);
 }
